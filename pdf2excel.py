@@ -8,13 +8,14 @@ PDF 批量转 Excel（一个 PDF 一个工作表）。
 识别思路：
 1. PyMuPDF 把每页渲染成图。
 2. RapidOCR 识别文字（得到带坐标的文本框）。
-3. 表格结构识别（wired_table_rec / lineless_table_rec）给出每个单元格的
-   位置（cell_bboxes）和逻辑行列（logic_points）。
-4. 【关键】文本归位由我们自己做：每个 OCR 文本框按中心点落在哪个
-   单元格里，就归到那个单元格。这样多行的账号、跨行的名称不会错位。
+3. 【主路】reconstruct_from_ocr：直接用 OCR 文本框坐标重建表格——
+   用“框最多”的一行定表头与列边界，用最左列（序号）定逻辑行边界，
+   每个文本框按中心点归到对应单元格。多行折行的账号/名称不会错位，
+   且不依赖表格模型那套不稳定的内部文本归位。
+4. 回退：表格结构模型（wired/lineless）→ 坐标启发式拼表。
 5. table_to_excel 把单元格写成 Excel，还原合并单元格和边框。
-6. 把表格没接住的 OCR 文字补在表下面（保证不丢）。
-7. 若某页根本没检测到表格（比如快递面单），回退到按坐标启发式拼表。
+6. 把表格没接住的 OCR 文字补在表下面（保证不丢）；低置信度文字（水印）
+   不进表格，只进兜底区。
 
 环境：Windows + VSCode，只能 pip 装包，首次联网下模型，之后可离线。
 """
@@ -429,10 +430,31 @@ def find_pdfs(input_path: str) -> List[str]:
     return sorted(out)
 
 
-def convert(input_path: str, output_path: str, dpi: int = 300):
+def _ocr_to_debug(ocr_result: list):
+    out = []
+    for item in ocr_result:
+        try:
+            quad, text = item[0], item[1]
+            score = float(item[2]) if len(item) > 2 else 1.0
+            xs = [p[0] for p in quad]
+            ys = [p[1] for p in quad]
+            out.append({"text": str(text), "score": round(score, 3),
+                        "x0": round(min(xs), 1), "y0": round(min(ys), 1),
+                        "x1": round(max(xs), 1), "y1": round(max(ys), 1)})
+        except Exception:
+            continue
+    return out
+
+
+def convert(input_path: str, output_path: str, dpi: int = 300,
+            min_score: float = 0.5, debug: bool = False):
+    import json
     from openpyxl import Workbook
     from table_to_excel import write_table_to_sheet, write_cells_to_sheet
     from bs4 import BeautifulSoup
+    from reconstruct import reconstruct_from_ocr
+
+    debug_pages = []
 
     pdfs = find_pdfs(input_path)
     if not pdfs:
@@ -462,10 +484,28 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
                 print("    （未识别到文字）")
                 continue
 
+            dbg = {} if debug else None
+            recon = reconstruct_from_ocr(ocr_result, min_score=min_score, debug=dbg)
+            if debug:
+                debug_pages.append({
+                    "pdf": os.path.basename(pdf), "page": pno + 1,
+                    "ocr": _ocr_to_debug(ocr_result), "recon": dbg,
+                })
+
+            if recon is not None:
+                cells, nrows, ncols, covered = recon
+                missing = find_missing_texts(ocr_result, covered_keys=covered)
+                print(f"    ✓ 按坐标重建表格（{nrows}行×{ncols}列）；未归入文字 {len(missing)} 条")
+                row_cursor = write_cells_to_sheet(ws, cells, nrows, ncols, start_row=row_cursor)
+                row_cursor = _write_missing_block(ws, missing, row_cursor)
+                row_cursor += 1
+                continue
+
+            # 回退：表格结构模型
             res = recognize_table(img, ocr_result, prefer="wired")
             if res and res["type"] == "struct":
                 missing = find_missing_texts(ocr_result, covered_keys=res["covered"])
-                print(f"    ✓ 表格识别成功（几何归位）；未归入文字 {len(missing)} 条")
+                print(f"    ✓ 表格识别成功（模型几何归位）；未归入文字 {len(missing)} 条")
                 row_cursor = write_cells_to_sheet(ws, res["cells"], res["nrows"], res["ncols"], start_row=row_cursor)
                 row_cursor = _write_missing_block(ws, missing, row_cursor)
                 row_cursor += 1
@@ -493,14 +533,24 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
     wb.save(output_path)
     print(f"\n完成：{output_path}")
 
+    if debug:
+        dbg_path = output_path + ".debug.json"
+        with open(dbg_path, "w", encoding="utf-8") as f:
+            json.dump(debug_pages, f, ensure_ascii=False, indent=2)
+        print(f"调试信息已写入：{dbg_path}（若仍有错位，请把这个文件发我）")
+
 
 def main():
     ap = argparse.ArgumentParser(description="PDF 批量转 Excel（还原表格格式，不丢内容）")
     ap.add_argument("-i", "--input", required=True, help="PDF 文件或目录")
     ap.add_argument("-o", "--output", default="out.xlsx", help="输出 xlsx")
     ap.add_argument("--dpi", type=int, default=300, help="渲染 DPI（默认 300，扫描件不清晰可调 400）")
+    ap.add_argument("--min-score", type=float, default=0.5,
+                    help="OCR 置信度阈值（默认 0.5），低于此值的文字不进表格、只放到表下兜底区，可过滤水印")
+    ap.add_argument("--debug", action="store_true",
+                    help="导出每页 OCR 坐标与重建结果到 <输出>.debug.json，便于排查错位")
     args = ap.parse_args()
-    convert(args.input, args.output, dpi=args.dpi)
+    convert(args.input, args.output, dpi=args.dpi, min_score=args.min_score, debug=args.debug)
 
 
 if __name__ == "__main__":
