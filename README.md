@@ -37,7 +37,7 @@
 
 **三步上手：**
 
-1. **装** —— 跟 agent 说一句，让它把 https://github.com/hhaa134323/audit-pdf2excel 克隆下来，并装好依赖。
+1. **装** —— 拿到代码、装好依赖（见下面「装」，没 git 也能装）。
 2. **放** —— 把要转的 PDF 放进任意一个文件夹。
 3. **说** —— 告诉 agent：用 audit-pdf2excel 帮我把这个文件夹里的 PDF 转成 Excel。剩下的它自动跑完。
 
@@ -45,13 +45,25 @@
 
 ### 装（第一次）
 
-**用 agent 装（推荐）** —— 直接对 Cline 说：
+> 这一步只在第一次配置时做。下面给两条路，**没装 git 也能用**。
 
-> 把 https://github.com/hhaa134323/audit-pdf2excel 克隆到本地，帮我建一个虚拟环境并按 requirements.txt 装好依赖。
+**方式一：下载 ZIP（不需要 git，最省事，推荐）**
 
-agent 会自己跑 `git clone` 和 `pip install`。仓库里的 `AGENTS.md` / `.clinerules` 已经写好了环境约束和跑法，agent 会自动遵守。
+1. 浏览器打开 https://github.com/hhaa134323/audit-pdf2excel
+2. 点绿色的 **Code** 按钮 → **Download ZIP**
+3. 解压到一个固定位置，比如 `D:\AgentProjects\audit-pdf2excel`
+4. 然后装依赖（Windows）：
 
-**自己装（会命令行的话）** —— Windows 下：
+```bat
+cd D:\AgentProjects\audit-pdf2excel
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+或者更省事：把解压后的文件夹直接拖进 VSCode，对 Cline 说「帮我建虚拟环境并按 requirements.txt 装好依赖」，让它代劳后面几步。
+
+**方式二：git clone（装了 git 的话）**
 
 ```bat
 git clone https://github.com/hhaa134323/audit-pdf2excel.git
@@ -60,6 +72,15 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+> 报 `git 不是内部或外部命令` / `git: command not found`，就是没装 git。要么用上面的方式一下 ZIP，要么去 https://git-scm.com/download/win 装个 git 再重来。
+> 同样，报 `python 不是内部或外部命令` 就是没装 Python，去 https://www.python.org/downloads/ 装，装的时候勾上「Add Python to PATH」。
+
+**让 agent 装（推荐给不熟命令行的人）** —— 直接对 Cline 说：
+
+> 从 https://github.com/hhaa134323/audit-pdf2excel 获取代码（如果没装 git，就直接下载 ZIP 解压，别卡在 git clone），然后帮我建一个虚拟环境并按 requirements.txt 装好依赖。
+
+这样即使机器上没有 git，agent 也会改走下载 ZIP 的路，不会卡住。仓库里的 `AGENTS.md` / `.clinerules` 已经写好了环境约束和跑法，agent 会自动遵守。
 
 ### 放
 
