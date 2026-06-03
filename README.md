@@ -45,42 +45,50 @@
 
 ### 装（第一次）
 
-> 这一步只在第一次配置时做。下面给两条路，**没装 git 也能用**。
+> 这一步只在第一次配置时做。先看下面两条，能省掉绝大多数「装不上」的麻烦：
+>
+> - **Python 用 3.10–3.12（推荐 3.12）。** OCR 那几个包（onnxruntime / rapidocr / 表格识别）暂时还没出 Python 3.13 的安装包，用 3.13 会卡在装不上。命令行跑 `python --version` 看版本，是 3.13 的话去 https://www.python.org/downloads/ 装个 3.12，装时勾上「Add Python to PATH」。
+> - **国内装一定加清华镜像。** 否则默认源经常几 kB/s、动辄超时（pymupdf、onnxruntime 都是几十 MB）。下面命令都带上了 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 
 **方式一：下载 ZIP（不需要 git，最省事，推荐）**
 
 1. 浏览器打开 https://github.com/hhaa134323/audit-pdf2excel
 2. 点绿色的 **Code** 按钮 → **Download ZIP**
 3. 解压到一个固定位置，比如 `D:\AgentProjects\audit-pdf2excel`
-4. 然后装依赖（Windows）：
+4. 装依赖（Windows）：
 
 ```bat
 cd D:\AgentProjects\audit-pdf2excel
-python -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
 
-或者更省事：把解压后的文件夹直接拖进 VSCode，对 Cline 说「帮我建虚拟环境并按 requirements.txt 装好依赖」，让它代劳后面几步。
+> 激活（第二行 `.venv\Scripts\activate`）成功后，命令行前面会出现 `(.venv)`。**一定要看到 `(.venv)` 再 pip install**，否则会装到系统 Python 里（症状是 pip 提示 “Defaulting to user installation”）。
+
+或者更省事：把解压后的文件夹拖进 VSCode，对 Cline 说「用 Python 3.12 建虚拟环境，加清华镜像按 requirements.txt 装好依赖」，让它代劳。
 
 **方式二：git clone（装了 git 的话）**
 
 ```bat
 git clone https://github.com/hhaa134323/audit-pdf2excel.git
 cd audit-pdf2excel
-python -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
 
-> 报 `git 不是内部或外部命令` / `git: command not found`，就是没装 git。要么用上面的方式一下 ZIP，要么去 https://git-scm.com/download/win 装个 git 再重来。
-> 同样，报 `python 不是内部或外部命令` 就是没装 Python，去 https://www.python.org/downloads/ 装，装的时候勾上「Add Python to PATH」。
+> 报错速查：
+> - `git 不是内部或外部命令` / `git: command not found` → 没装 git。用方式一下 ZIP，或去 https://git-scm.com/download/win 装。
+> - `python` / `py 不是内部或外部命令` → 没装 Python，去 https://www.python.org/downloads/ 装 3.12，勾「Add Python to PATH」。
+> - 下载卡着不动 / `ReadTimeoutError` → 网络慢，确认带了清华镜像 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
+> - 提示 `Defaulting to user installation` → 没激活虚拟环境，先 `.venv\Scripts\activate` 看到 `(.venv)` 再装。
 
 **让 agent 装（推荐给不熟命令行的人）** —— 直接对 Cline 说：
 
-> 从 https://github.com/hhaa134323/audit-pdf2excel 获取代码（如果没装 git，就直接下载 ZIP 解压，别卡在 git clone），然后帮我建一个虚拟环境并按 requirements.txt 装好依赖。
+> 从 https://github.com/hhaa134323/audit-pdf2excel 获取代码（没装 git 就直接下载 ZIP 解压，别卡在 git clone）。用 Python 3.12 建虚拟环境，激活后加清华镜像 `-i https://pypi.tuna.tsinghua.edu.cn/simple` 按 requirements.txt 装好依赖。
 
-这样即使机器上没有 git，agent 也会改走下载 ZIP 的路，不会卡住。仓库里的 `AGENTS.md` / `.clinerules` 已经写好了环境约束和跑法，agent 会自动遵守。
+这样即使机器上没 git、网络慢、或默认 Python 是 3.13，agent 也知道怎么绕开。仓库里的 `AGENTS.md` / `.clinerules` 也写了同样的约束，agent 会自动遵守。
 
 ### 放
 

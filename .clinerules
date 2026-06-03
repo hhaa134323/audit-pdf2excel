@@ -3,9 +3,12 @@
 详细说明见 AGENTS.md。核心几条：
 
 1. 环境：Windows 11 + VSCode，**只用 pip 包**，禁止依赖需单独安装的外部软件（Tesseract / poppler 等）。
-2. PDF 是扫描/拍照件，【没有可选文字】，**必须 OCR**；不要改用 pdfplumber/pypdf 直接提文字。
-3. 技术栈固定：pymupdf + rapidocr-onnxruntime + openpyxl + numpy；RapidOCR 首次联网下模型，之后离线。
-4. 运行：`python -m venv .venv` → `.venv\Scripts\activate` → `pip install -r requirements.txt` → `python pdf2excel.py -i .\pdfs -o .\out.xlsx --dpi 300`。
-5. 环境自检：`python tests\test_reconstruct.py` 应输出 OK。
-6. pip 装不上 / 没网 / OCR 不准 时，**先问用户，不要擅自换方案**；识别不准先试 `--dpi 400`。
-7. 目标：每个 PDF 一个工作表，尽量还原成表格（行列对齐）。
+2. 装代码别假设有 git：`git` 不可用就从 https://github.com/hhaa134323/audit-pdf2excel 下 ZIP 解压，别卡在 git clone。
+3. Python 用 3.10-3.12（推荐 3.12）：OCR 依赖没有 3.13 的 wheel。建环境用 `py -3.12 -m venv .venv`，**激活后再装**（没激活会提示 Defaulting to user installation）。
+4. 装依赖加清华镜像：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt`，否则默认源常超时（pymupdf、onnxruntime 都是几十 MB）。
+5. PDF 是扫描/拍照件，【没有可选文字】，**必须 OCR**；不要改用 pdfplumber/pypdf 直接提文字。
+6. 技术栈固定：pymupdf + rapidocr-onnxruntime + wired/lineless-table-rec（回退用）+ openpyxl + bs4/lxml + numpy；这些「模型」都是识别型小模型，不是生成式 LLM。
+7. 识别主路是 `reconstruct.py` 的 `reconstruct_from_ocr()`——纯几何、用 OCR 文本框坐标重建表格（表头定列、最左列定行、超宽框按字符切列）；找不到表头才回退到表格识别模型/坐标拼表。**别按旧的“y 聚行 x 聚列”理解。**
+8. 运行：`python pdf2excel.py -i .\pdfs -o .\out.xlsx --dpi 300`；环境自检 `python tests\test_reconstruct.py` 应输出 OK。
+9. 列错位用 `--debug` 导出 debug.json，照真实坐标调，别瞎猜；pip 装不上/没网/OCR 不准先问用户，不要擅自换方案。
+10. 目标：每个 PDF 一个工作表，尽量还原成表格（行列对齐、合并、边框），账号等关键列别串列。
