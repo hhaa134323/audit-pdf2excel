@@ -1,0 +1,11 @@
+# Cline 规则 · audit-pdf2excel
+
+详细说明见 AGENTS.md。核心几条：
+
+1. 环境：Windows 11 + VSCode，**只用 pip 包**，禁止依赖需单独安装的外部软件（Tesseract / poppler 等）。
+2. PDF 是扫描/拍照件，【没有可选文字】，**必须 OCR**；不要改用 pdfplumber/pypdf 直接提文字。
+3. 技术栈固定：pymupdf + rapidocr-onnxruntime + openpyxl + numpy；RapidOCR 首次联网下模型，之后离线。
+4. 运行：`python -m venv .venv` → `.venv\Scripts\activate` → `pip install -r requirements.txt` → `python pdf2excel.py -i .\pdfs -o .\out.xlsx --dpi 300`。
+5. 环境自检：`python tests\test_reconstruct.py` 应输出 OK。
+6. pip 装不上 / 没网 / OCR 不准 时，**先问用户，不要擅自换方案**；识别不准先试 `--dpi 400`。
+7. 目标：每个 PDF 一个工作表，尽量还原成表格（行列对齐）。
