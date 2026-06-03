@@ -3,17 +3,18 @@
 PDF 批量转 Excel（一个 PDF 一个工作表）。
 
 重点：尽量还原 PDF 里的表格显示格式（行列、合并单元格、边框），
-同时保证不丢内容：即使表格模型在低质量扫描件上漏识了某些格，
-也会把未归入表格的 OCR 文字补在下面，供人工核对。
+同时保证不丢内容。
 
 识别思路：
 1. PyMuPDF 把每页渲染成图。
-2. RapidOCR 识别文字。
-3. 表格结构识别（wired_table_rec / lineless_table_rec）把 OCR 结果
-   组成带 rowspan/colspan 的 HTML 表格。
-4. table_to_excel 把 HTML 表格写成 Excel，还原合并单元格和边框。
-5. 把表格没接住的 OCR 文字补在表下面（保证不丢）。
-6. 若某页根本没检测到表格（比如快递面单、无线文本），回退到按坐标启发式拼表。
+2. RapidOCR 识别文字（得到带坐标的文本框）。
+3. 表格结构识别（wired_table_rec / lineless_table_rec）给出每个单元格的
+   位置（cell_bboxes）和逻辑行列（logic_points）。
+4. 【关键】文本归位由我们自己做：每个 OCR 文本框按中心点落在哪个
+   单元格里，就归到那个单元格。这样多行的账号、跨行的名称不会错位。
+5. table_to_excel 把单元格写成 Excel，还原合并单元格和边框。
+6. 把表格没接住的 OCR 文字补在表下面（保证不丢）。
+7. 若某页根本没检测到表格（比如快递面单），回退到按坐标启发式拼表。
 
 环境：Windows + VSCode，只能 pip 装包，首次联网下模型，之后可离线。
 """
@@ -24,7 +25,7 @@ import importlib
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -72,21 +73,56 @@ def ocr_image(img_bgr) -> list:
 
 
 # ----------------------------------------------------------------------------
-# 表格结构识别 → HTML
+# 文本框
+# ----------------------------------------------------------------------------
+@dataclass
+class Box:
+    text: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @property
+    def cx(self):
+        return (self.x0 + self.x1) / 2
+
+    @property
+    def cy(self):
+        return (self.y0 + self.y1) / 2
+
+    @property
+    def h(self):
+        return self.y1 - self.y0
+
+
+def _to_boxes(ocr_result: list) -> List[Box]:
+    boxes = []
+    for item in ocr_result:
+        try:
+            quad, text = item[0], item[1]
+            xs = [p[0] for p in quad]
+            ys = [p[1] for p in quad]
+            boxes.append(Box(str(text), min(xs), min(ys), max(xs), max(ys)))
+        except Exception:
+            continue
+    return boxes
+
+
+def _norm(s) -> str:
+    return re.sub(r"\s+", "", str(s))
+
+
+# ----------------------------------------------------------------------------
+# 表格结构识别引擎
 # 重要：WiredTableRecognition / LinelessTableRecognition 不是无参构造，
 # 需要传 WiredTableInput / LinelessTableInput（配置类常在 .main 里，不一定从包根导出）。
-# 这里按多种可能的 API 形状依次尝试，兼容不同版本。
 # ----------------------------------------------------------------------------
 _WIRED = None
 _LINELESS = None
 
 
 def _build_engine(kind: str):
-    """构造表格识别引擎，兼容：
-      - WiredTableRecognition(WiredTableInput())   # 新版，需配置对象
-      - WiredTableRecognition()                    # 旧版，无参
-    配置类优先从包根找，找不到再从 .main 找。
-    """
     if kind == "wired":
         pkg_name, rec_name, input_name = "wired_table_rec", "WiredTableRecognition", "WiredTableInput"
     else:
@@ -96,7 +132,6 @@ def _build_engine(kind: str):
     rec_cls = getattr(pkg, rec_name, None)
     input_cls = getattr(pkg, input_name, None)
 
-    # 配置类 / 识别类 可能只在 .main 里
     if rec_cls is None or input_cls is None:
         try:
             main_mod = importlib.import_module(pkg_name + ".main")
@@ -109,7 +144,6 @@ def _build_engine(kind: str):
         raise ImportError(f"找不到 {rec_name}，请确认已 pip install {pkg_name}")
 
     last_err = None
-    # 优先用配置对象构造（新版），再回退到无参（旧版）
     if input_cls is not None:
         try:
             return rec_cls(input_cls())
@@ -136,27 +170,118 @@ def _load_lineless():
     return _LINELESS
 
 
-def _extract_html(ret) -> Optional[str]:
-    """从不同版本的返回值里拿出 HTML 字符串。"""
-    if ret is None:
+def _to_xyxy(bbox) -> Optional[Tuple[float, float, float, float]]:
+    """把 cell bbox 统一成 (x0,y0,x1,y1)。支持 [x0,y0,x1,y1]、
+    8 个数的多边形、或 4 个点的多边形。"""
+    if bbox is None:
         return None
-    # 新版：输出对象带 .pred_html
-    html = getattr(ret, "pred_html", None)
-    if html:
-        return html
-    # 旧版：(html, elapse, polygons, logic_points, ocr_res) 元组
-    if isinstance(ret, (tuple, list)) and ret:
-        first = ret[0]
-        if isinstance(first, str) and "<" in first:
-            return first
-    if isinstance(ret, str) and "<" in ret:
-        return ret
+    arr = np.asarray(bbox, dtype=float).flatten()
+    if arr.size == 4:
+        x0, y0, x1, y1 = arr
+        return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    if arr.size >= 8 and arr.size % 2 == 0:
+        xs = arr[0::2]; ys = arr[1::2]
+        return (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
     return None
 
 
-def recognize_table_html(img_bgr, ocr_result: list, prefer: str = "wired") -> Optional[str]:
-    """返回表格 HTML；失败或没检测到表格返回 None。"""
+def _extract_struct(ret):
+    """从不同版本的返回值里拿出 (html, cell_bboxes, logic_points)。
+    任何一项拿不到就是 None。"""
+    html = getattr(ret, "pred_html", None)
+    cell_bboxes = getattr(ret, "cell_bboxes", None)
+    logic_points = getattr(ret, "logic_points", None)
+
+    if isinstance(ret, (tuple, list)):
+        if html is None and ret and isinstance(ret[0], str) and "<" in ret[0]:
+            html = ret[0]
+        if cell_bboxes is None and len(ret) >= 3:
+            cell_bboxes = ret[2]
+        if logic_points is None and len(ret) >= 4:
+            logic_points = ret[3]
+    elif isinstance(ret, str) and "<" in ret:
+        html = html or ret
+
+    return html, cell_bboxes, logic_points
+
+
+def _group_lines(items: List[Box]) -> str:
+    """把一个单元格里的多个文本框按阅读顺序（从上到下、从左到右）拼接。
+    中文/数字场景直接拼接，不加空格（账号换行合并不会丢位）。"""
+    if not items:
+        return ""
+    med_h = float(np.median([b.h for b in items if b.h > 0]) or 12)
+    items = sorted(items, key=lambda b: b.cy)
+    lines: List[List[Box]] = [[items[0]]]
+    for b in items[1:]:
+        if abs(b.cy - lines[-1][-1].cy) <= med_h * 0.6:
+            lines[-1].append(b)
+        else:
+            lines.append([b])
+    parts = []
+    for line in lines:
+        line.sort(key=lambda b: b.x0)
+        parts.append("".join(b.text for b in line))
+    return "".join(parts)
+
+
+def build_cells_by_geometry(cell_bboxes, logic_points, ocr_result: list):
+    """用单元格几何 + OCR 文本框中心包含关系，自己做文本归位。
+    返回 (cells, n_rows, n_cols, covered_keys) 或 None（几何信息不可用）。
+    cells: [{r0,r1,c0,c1,text}]
+    """
+    if cell_bboxes is None or logic_points is None:
+        return None
+    try:
+        bboxes = [_to_xyxy(b) for b in cell_bboxes]
+        lps = [list(np.asarray(p, dtype=float).flatten()) for p in logic_points]
+    except Exception:
+        return None
+    if not bboxes or len(bboxes) != len(lps):
+        return None
+
+    boxes = _to_boxes(ocr_result)
+    cell_items: List[List[Box]] = [[] for _ in bboxes]
+    covered_keys = set()
+
+    def center_in(bb, b):
+        x0, y0, x1, y1 = bb
+        pad = max(2.0, (y1 - y0) * 0.15)  # 略微外扩，容忍单元格边界偏差
+        return (x0 - pad) <= b.cx <= (x1 + pad) and (y0 - pad) <= b.cy <= (y1 + pad)
+
+    for b in boxes:
+        best, best_area = -1, -1.0
+        for i, bb in enumerate(bboxes):
+            if bb is None:
+                continue
+            if center_in(bb, b):
+                area = (bb[2] - bb[0]) * (bb[3] - bb[1])
+                if best == -1 or area < best_area:  # 嵌套时选最小单元格
+                    best, best_area = i, area
+        if best >= 0:
+            cell_items[best].append(b)
+            covered_keys.add(_norm(b.text))
+
+    cells = []
+    max_r = max_c = 0
+    for i, lp in enumerate(lps):
+        if len(lp) < 4:
+            continue
+        r0, r1, c0, c1 = int(lp[0]), int(lp[1]), int(lp[2]), int(lp[3])
+        cells.append({"r0": r0, "r1": r1, "c0": c0, "c1": c1, "text": _group_lines(cell_items[i])})
+        max_r = max(max_r, r1); max_c = max(max_c, c1)
+    if not cells:
+        return None
+    return cells, max_r + 1, max_c + 1, covered_keys
+
+
+def recognize_table(img_bgr, ocr_result: list, prefer: str = "wired"):
+    """返回一个 dict：
+      {"type":"struct", "cells":..., "nrows":..., "ncols":..., "covered":set}  最佳
+      {"type":"html",   "html":...}                                          次优
+    都失败返回 None。"""
     order = ["wired", "lineless"] if prefer == "wired" else ["lineless", "wired"]
+    fallback_html = None
     for kind in order:
         try:
             engine = _load_wired() if kind == "wired" else _load_lineless()
@@ -168,25 +293,31 @@ def recognize_table_html(img_bgr, ocr_result: list, prefer: str = "wired") -> Op
                 ret = engine(img_bgr, ocr_result=ocr_result)
             except TypeError:
                 ret = engine(img_bgr)
-            html = _extract_html(ret)
-            if html and "<td" in html.lower():
-                return html
+            html, cell_bboxes, logic_points = _extract_struct(ret)
+            built = build_cells_by_geometry(cell_bboxes, logic_points, ocr_result)
+            if built:
+                cells, nrows, ncols, covered = built
+                return {"type": "struct", "cells": cells, "nrows": nrows,
+                        "ncols": ncols, "covered": covered}
+            if html and "<td" in html.lower() and fallback_html is None:
+                fallback_html = html
         except Exception as e:
             print(f"    [表格识别-{kind}] 运行出错，跳过：{e}")
+    if fallback_html:
+        return {"type": "html", "html": fallback_html}
     return None
 
 
 # ----------------------------------------------------------------------------
 # 不丢内容：找出表格没接住的 OCR 文字
 # ----------------------------------------------------------------------------
-def _norm(s) -> str:
-    return re.sub(r"\s+", "", str(s))
-
-
-def find_missing_texts(html: str, ocr_result: list) -> List[str]:
-    """返回 OCR 识别到、但没出现在表格 HTML 里的文字（去重后）。"""
-    from bs4 import BeautifulSoup
-    table_text = _norm(BeautifulSoup(html, "lxml").get_text())
+def find_missing_texts(ocr_result: list, covered_text: str = "", covered_keys=None) -> List[str]:
+    """返回 OCR 识别到、但没被表格接住的文字（去重后）。
+    - struct 模式：传 covered_keys（已归位的 _norm 文本集合）
+    - html 模式：传 covered_text（表格纯文本）
+    """
+    covered_keys = covered_keys or set()
+    table_text = _norm(covered_text)
     missing, seen = [], set()
     for item in ocr_result:
         if len(item) < 2:
@@ -195,45 +326,18 @@ def find_missing_texts(html: str, ocr_result: list) -> List[str]:
         key = _norm(raw)
         if not key or key in seen:
             continue
-        if key not in table_text:
-            missing.append(raw)
-            seen.add(key)
+        if key in covered_keys:
+            continue
+        if table_text and key in table_text:
+            continue
+        missing.append(raw)
+        seen.add(key)
     return missing
 
 
 # ----------------------------------------------------------------------------
 # 回退方案：按坐标启发式拼表（无线 / 模型不可用时）
 # ----------------------------------------------------------------------------
-@dataclass
-class Box:
-    text: str
-    x0: float
-    y0: float
-    x1: float
-    y1: float
-
-    @property
-    def cy(self):
-        return (self.y0 + self.y1) / 2
-
-    @property
-    def h(self):
-        return self.y1 - self.y0
-
-
-def _to_boxes(ocr_result: list) -> List[Box]:
-    boxes = []
-    for item in ocr_result:
-        try:
-            quad, text = item[0], item[1]
-            xs = [p[0] for p in quad]
-            ys = [p[1] for p in quad]
-            boxes.append(Box(str(text), min(xs), min(ys), max(xs), max(ys)))
-        except Exception:
-            continue
-    return boxes
-
-
 def reconstruct_grid(ocr_result: list) -> List[List[str]]:
     """按行聚类 + 列聚类的启发式表格（不丢文字）。"""
     boxes = _to_boxes(ocr_result)
@@ -301,11 +405,10 @@ def _write_grid_with_borders(ws, grid: List[List[str]], start_row: int = 1) -> i
 
 
 def _write_missing_block(ws, missing: List[str], start_row: int) -> int:
-    """把未归入表格的文字补在下面，加一个提示抬头。"""
     if not missing:
         return start_row
     from openpyxl.styles import Font
-    r = start_row + 1  # 空一行
+    r = start_row + 1
     c = ws.cell(r, 1, "↓ 以下为未归入表格的识别文字（请人工核对）")
     c.font = Font(bold=True, color="C00000")
     r += 1
@@ -328,7 +431,8 @@ def find_pdfs(input_path: str) -> List[str]:
 
 def convert(input_path: str, output_path: str, dpi: int = 300):
     from openpyxl import Workbook
-    from table_to_excel import write_table_to_sheet
+    from table_to_excel import write_table_to_sheet, write_cells_to_sheet
+    from bs4 import BeautifulSoup
 
     pdfs = find_pdfs(input_path)
     if not pdfs:
@@ -358,11 +462,18 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
                 print("    （未识别到文字）")
                 continue
 
-            html = recognize_table_html(img, ocr_result, prefer="wired")
-            if html:
-                missing = find_missing_texts(html, ocr_result)
-                print(f"    ✓ 表格结构识别成功；未归入文字 {len(missing)} 条")
-                row_cursor = write_table_to_sheet(ws, html, start_row=row_cursor)
+            res = recognize_table(img, ocr_result, prefer="wired")
+            if res and res["type"] == "struct":
+                missing = find_missing_texts(ocr_result, covered_keys=res["covered"])
+                print(f"    ✓ 表格识别成功（几何归位）；未归入文字 {len(missing)} 条")
+                row_cursor = write_cells_to_sheet(ws, res["cells"], res["nrows"], res["ncols"], start_row=row_cursor)
+                row_cursor = _write_missing_block(ws, missing, row_cursor)
+                row_cursor += 1
+            elif res and res["type"] == "html":
+                table_text = BeautifulSoup(res["html"], "lxml").get_text()
+                missing = find_missing_texts(ocr_result, covered_text=table_text)
+                print(f"    ✓ 表格识别成功（HTML 回退）；未归入文字 {len(missing)} 条")
+                row_cursor = write_table_to_sheet(ws, res["html"], start_row=row_cursor)
                 row_cursor = _write_missing_block(ws, missing, row_cursor)
                 row_cursor += 1
             else:
@@ -371,7 +482,6 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
                 if grid:
                     row_cursor = _write_grid_with_borders(ws, grid, start_row=row_cursor) + 1
 
-        # 列宽粗调
         for col in ws.columns:
             try:
                 letter = col[0].column_letter
