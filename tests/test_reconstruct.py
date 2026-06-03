@@ -1,36 +1,41 @@
 # -*- coding: utf-8 -*-
-"""纯逻辑单测：不依赖 OCR / PDF 库，验证文本框 -> 表格 的重建。
-运行： python -m pytest tests/  或  python tests/test_reconstruct.py
-"""
-import os
-import sys
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from pdf2excel import boxes_to_cells, reconstruct_table
+from table_to_excel import parse_html_table
+import pdf2excel as P
 
 
-def _box(x0, y0, x1, y1):
-    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+def _box(x0, y0, x1, y1, t):
+    return [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]], t, 0.99]
 
 
-def test_three_by_three():
+def test_parse_html_merges():
+    html = (
+        '<table>'
+        '<tr><td colspan="2">A</td><td>B</td></tr>'
+        '<tr><td>c1</td><td>c2</td><td>c3</td></tr>'
+        '</table>'
+    )
+    grid, merges, ncols = parse_html_table(html)
+    assert ncols == 3
+    assert merges == [(0, 0, 0, 1)]
+    assert grid[0][0] == "A"
+    assert grid[1] == ["c1", "c2", "c3"]
+
+
+def test_reconstruct_grid_fallback():
     ocr = [
-        [_box(60, 100, 140, 130), "序号", 0.99],
-        [_box(220, 100, 360, 130), "账号", 0.99],
-        [_box(520, 100, 680, 130), "账户名称", 0.99],
-        [_box(60, 160, 120, 190), "1", 0.99],
-        [_box(220, 160, 470, 190), "95508802498624", 0.98],
-        [_box(520, 160, 760, 190), "柳州华埦康医疗科技", 0.97],
-        [_box(60, 220, 120, 250), "2", 0.99],
-        [_box(220, 220, 470, 250), "12345678901234", 0.98],
-        [_box(520, 220, 760, 250), "某某公司", 0.97],
+        _box(10, 10, 60, 30, "序号"), _box(120, 10, 220, 30, "名称"), _box(300, 10, 400, 30, "金额"),
+        _box(10, 50, 60, 70, "1"), _box(120, 50, 240, 70, "现金"), _box(300, 50, 400, 70, "100"),
     ]
-    grid = reconstruct_table(boxes_to_cells(ocr))
-    assert len(grid) == 3
-    assert grid[0] == ["序号", "账号", "账户名称"]
-    assert grid[1] == ["1", "95508802498624", "柳州华埦康医疗科技"]
+    grid = P.reconstruct_grid(ocr)
+    assert len(grid) == 2
+    assert grid[0] == ["序号", "名称", "金额"]
+    assert grid[1] == ["1", "现金", "100"]
 
 
 if __name__ == "__main__":
-    test_three_by_three()
-    print("OK")
+    test_parse_html_merges()
+    test_reconstruct_grid_fallback()
+    print("ALL TESTS OK")

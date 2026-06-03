@@ -1,37 +1,138 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audit-pdf2excel
-================
-批量把扫描件 PDF 通过 OCR 转成 Excel：一个 PDF 一个工作表，尽量还原表格行列。
+PDF 批量转 Excel（一个 PDF 一个工作表）。
 
-设计约束（为“能跑脚本、但不确定能装软件”的 Windows + VSCode 环境）：
-    全部依赖都用 pip 装，不需要管理员权限、不需要装 Tesseract / poppler 等外部软件。
-        pip install pymupdf rapidocr-onnxruntime openpyxl numpy
+重点：尽量还原 PDF 里的表格显示格式（行列、合并单元格、边框）。
 
-用法：
-    python pdf2excel.py -i ./pdfs -o ./out.xlsx
-    python pdf2excel.py -i ./pdfs -o ./out.xlsx --dpi 300
+识别思路：
+1. PyMuPDF 把每页渲染成图。
+2. RapidOCR 识别文字。
+3. 表格结构识别（wired_table_rec / lineless_table_rec）把 OCR 结果
+   组成带 rowspan/colspan 的 HTML 表格。
+4. table_to_excel 把 HTML 表格写成 Excel，还原合并单元格和边框。
+5. 若某页没检测到表格（比如快递面单、无线文本），回退到按坐标启发式拼表。
 
-OCR 引擎：RapidOCR（rapidocr-onnxruntime），纯pip包、自带中英文模型、首次运行后可完全离线。
+环境：Windows + VSCode，只能 pip 装包，首次联网下模型，之后可离线。
 """
 from __future__ import annotations
 
 import argparse
 import os
 import re
-import sys
-import glob
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
+
+import numpy as np
 
 
 # ----------------------------------------------------------------------------
-# 数据结构
+# 渲染 PDF
+# ----------------------------------------------------------------------------
+def render_pdf_pages(path: str, dpi: int = 300):
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(path)
+    total = doc.page_count
+    scale = dpi / 72.0
+    for i in range(total):
+        page = doc[i]
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = img[:, :, :3]
+        elif pix.n == 1:
+            img = np.repeat(img, 3, axis=2)
+        yield i, total, img[:, :, ::-1].copy()  # BGR
+    doc.close()
+
+
+# ----------------------------------------------------------------------------
+# OCR（RapidOCR）
+# ----------------------------------------------------------------------------
+_OCR_ENGINE = None
+
+
+def get_ocr_engine():
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+
+
+def ocr_image(img_bgr) -> list:
+    """返回 RapidOCR 格式：[[box(4点), text, score], ...]，没识别到返回 []。"""
+    engine = get_ocr_engine()
+    result, _ = engine(img_bgr)
+    return result or []
+
+
+# ----------------------------------------------------------------------------
+# 表格结构识别 → HTML
+# 优先用 wired_table_rec（有线表），其次 lineless_table_rec（无线表）。
+# 不同版本 API 不一样，这里做了兼容和异常保护。
+# ----------------------------------------------------------------------------
+_WIRED = None
+_LINELESS = None
+
+
+def _load_wired():
+    global _WIRED
+    if _WIRED is None:
+        from wired_table_rec import WiredTableRecognition
+        _WIRED = WiredTableRecognition()
+    return _WIRED
+
+
+def _load_lineless():
+    global _LINELESS
+    if _LINELESS is None:
+        from lineless_table_rec import LinelessTableRecognition
+        _LINELESS = LinelessTableRecognition()
+    return _LINELESS
+
+
+def _extract_html(ret) -> Optional[str]:
+    """从不同版本的返回值里拿出 HTML 字符串。"""
+    if ret is None:
+        return None
+    # 新版：对象带 .pred_html
+    html = getattr(ret, "pred_html", None)
+    if html:
+        return html
+    # 旧版：(html, elapse, polygons, logic_points, ocr_res) 元组
+    if isinstance(ret, (tuple, list)) and ret:
+        first = ret[0]
+        if isinstance(first, str) and "<" in first:
+            return first
+    if isinstance(ret, str) and "<" in ret:
+        return ret
+    return None
+
+
+def recognize_table_html(img_bgr, ocr_result: list, prefer: str = "wired") -> Optional[str]:
+    """返回表格 HTML；失败或没检测到表格返回 None。"""
+    order = ["wired", "lineless"] if prefer == "wired" else ["lineless", "wired"]
+    for kind in order:
+        try:
+            engine = _load_wired() if kind == "wired" else _load_lineless()
+            try:
+                ret = engine(img_bgr, ocr_result=ocr_result)
+            except TypeError:
+                ret = engine(img_bgr)
+            html = _extract_html(ret)
+            if html and "<td" in html.lower():
+                return html
+        except Exception as e:
+            print(f"    [表格识别-{kind}] 跳过：{e}")
+    return None
+
+
+# ----------------------------------------------------------------------------
+# 回退方案：按坐标启发式拼表（无线 / 模型不可用时）
 # ----------------------------------------------------------------------------
 @dataclass
-class Cell:
-    """一个 OCR 识别出的文本框。"""
+class Box:
     text: str
     x0: float
     y0: float
@@ -39,235 +140,171 @@ class Cell:
     y1: float
 
     @property
-    def cx(self) -> float:
+    def cx(self):
         return (self.x0 + self.x1) / 2
 
     @property
-    def cy(self) -> float:
+    def cy(self):
         return (self.y0 + self.y1) / 2
 
     @property
-    def h(self) -> float:
-        return max(self.y1 - self.y0, 1.0)
+    def h(self):
+        return self.y1 - self.y0
 
 
-def _median(values: Sequence[float]) -> float:
-    s = sorted(values)
-    n = len(s)
-    if n == 0:
-        return 0.0
-    if n % 2:
-        return s[n // 2]
-    return (s[n // 2 - 1] + s[n // 2]) / 2
-
-
-# ----------------------------------------------------------------------------
-# OCR 结果 -> 表格重建（不依赖任何 OCR 库，可单独单测）
-# ----------------------------------------------------------------------------
-def boxes_to_cells(ocr_result: Sequence) -> List[Cell]:
-    """把 RapidOCR 的 [box, text, score] 列表转成 Cell 列表。
-
-    box 是四个角点 [[x,y],[x,y],[x,y],[x,y]]。
-    """
-    cells: List[Cell] = []
+def _to_boxes(ocr_result: list) -> List[Box]:
+    boxes = []
     for item in ocr_result:
-        box, text = item[0], item[1]
-        t = (text or "").strip()
-        if not t:
+        try:
+            quad, text = item[0], item[1]
+            xs = [p[0] for p in quad]
+            ys = [p[1] for p in quad]
+            boxes.append(Box(str(text), min(xs), min(ys), max(xs), max(ys)))
+        except Exception:
             continue
-        xs = [float(p[0]) for p in box]
-        ys = [float(p[1]) for p in box]
-        cells.append(Cell(t, min(xs), min(ys), max(xs), max(ys)))
-    return cells
+    return boxes
 
 
-def cluster_rows(cells: List[Cell]) -> List[List[Cell]]:
-    """按垂直位置把文本框聚成一行一行。"""
-    if not cells:
+def reconstruct_grid(ocr_result: list) -> List[List[str]]:
+    """按行聚类 + 列聚类的启发式表格。"""
+    boxes = _to_boxes(ocr_result)
+    if not boxes:
         return []
-    med_h = _median([c.h for c in cells]) or 1.0
-    ordered = sorted(cells, key=lambda c: c.cy)
-    rows: List[List[Cell]] = []
-    cur: List[Cell] = [ordered[0]]
-    cur_cy = ordered[0].cy
-    for c in ordered[1:]:
-        if abs(c.cy - cur_cy) <= 0.6 * med_h:
-            cur.append(c)
-            cur_cy = sum(x.cy for x in cur) / len(cur)
+    boxes.sort(key=lambda b: b.cy)
+    med_h = float(np.median([b.h for b in boxes if b.h > 0]) or 12)
+
+    # 分行
+    rows: List[List[Box]] = []
+    cur: List[Box] = [boxes[0]]
+    for b in boxes[1:]:
+        if abs(b.cy - cur[-1].cy) <= med_h * 0.7:
+            cur.append(b)
         else:
-            rows.append(cur)
-            cur = [c]
-            cur_cy = c.cy
+            rows.append(cur); cur = [b]
     rows.append(cur)
-    for r in rows:
-        r.sort(key=lambda c: c.x0)
-    return rows
 
+    # 由所有 box 的左边界聚类出列
+    lefts = sorted(b.x0 for b in boxes)
+    cols: List[float] = [lefts[0]]
+    for x in lefts[1:]:
+        if x - cols[-1] > med_h * 1.5:
+            cols.append(x)
+    ncols = len(cols)
 
-def detect_columns(cells: List[Cell]) -> List[float]:
-    """根据所有文本框的左边界聚类，推断出列的起始 x 坐标。"""
-    if not cells:
-        return [0.0]
-    med_h = _median([c.h for c in cells]) or 1.0
-    gap = 1.5 * med_h
-    xs = sorted(c.x0 for c in cells)
-    col_starts: List[float] = []
-    cluster = [xs[0]]
-    prev = xs[0]
-    for x in xs[1:]:
-        if x - prev > gap:
-            col_starts.append(min(cluster))
-            cluster = [x]
-        else:
-            cluster.append(x)
-        prev = x
-    col_starts.append(min(cluster))
-    return col_starts
+    def col_of(b: Box) -> int:
+        return min(range(ncols), key=lambda i: abs(b.x0 - cols[i]))
 
-
-def _assign_col(x0: float, col_starts: List[float]) -> int:
-    return min(range(len(col_starts)), key=lambda i: abs(col_starts[i] - x0))
-
-
-def reconstruct_table(cells: List[Cell]) -> List[List[str]]:
-    """把 OCR 文本框重建成二维表格（行 x 列）。"""
-    if not cells:
-        return []
-    rows = cluster_rows(cells)
-    col_starts = detect_columns(cells)
-    ncols = len(col_starts)
     grid: List[List[str]] = []
-    for r in rows:
+    for row in rows:
         line = [""] * ncols
-        for c in r:
-            ci = _assign_col(c.x0, col_starts)
-            line[ci] = (line[ci] + " " + c.text).strip() if line[ci] else c.text
+        for b in sorted(row, key=lambda b: b.x0):
+            ci = col_of(b)
+            line[ci] = (line[ci] + " " + b.text).strip() if line[ci] else b.text
         grid.append(line)
     return grid
 
 
 # ----------------------------------------------------------------------------
-# PDF 渲染 + OCR（需要 pymupdf / rapidocr / numpy）
+# 写 Excel
 # ----------------------------------------------------------------------------
-def render_pdf_pages(path: str, dpi: int):
-    """把 PDF 逐页渲染成 BGR 图像（numpy 数组）。yield (page_no, total, img)。"""
-    import fitz  # PyMuPDF
-    import numpy as np
-
-    doc = fitz.open(path)
-    total = doc.page_count
-    scale = dpi / 72.0
-    mat = fitz.Matrix(scale, scale)
-    for i, page in enumerate(doc, 1):
-        pix = page.get_pixmap(matrix=mat)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        if pix.n == 4:
-            img = img[:, :, :3]
-        elif pix.n == 1:
-            img = np.repeat(img, 3, axis=2)
-        # PyMuPDF 是 RGB，RapidOCR/cv2 习惯 BGR，转一下更稳
-        yield i, total, img[:, :, ::-1].copy()
-    doc.close()
+def sanitize_sheet_name(name: str) -> str:
+    name = re.sub(r"[\\/?*\[\]:]", "_", name)
+    name = name.strip() or "Sheet"
+    return name[:31]
 
 
-_ENGINE = None
-
-
-def get_engine():
-    global _ENGINE
-    if _ENGINE is None:
-        from rapidocr_onnxruntime import RapidOCR
-        _ENGINE = RapidOCR()
-    return _ENGINE
-
-
-def ocr_image(img) -> List:
-    engine = get_engine()
-    result, _ = engine(img)
-    return result or []
-
-
-# ----------------------------------------------------------------------------
-# Excel 输出
-# ----------------------------------------------------------------------------
-def sanitize_sheet_name(name: str, used: set) -> str:
-    name = re.sub(r"[\[\]\:\*\?\/\\]", "_", name).strip()[:31] or "Sheet"
-    base = name
-    i = 1
-    while name in used:
-        suffix = f"_{i}"
-        name = base[: 31 - len(suffix)] + suffix
-        i += 1
-    used.add(name)
-    return name
+def _write_grid_with_borders(ws, grid: List[List[str]], start_row: int = 1) -> int:
+    from openpyxl.styles import Border, Side, Alignment
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ncols = max((len(r) for r in grid), default=0)
+    for ri, row in enumerate(grid):
+        for ci in range(ncols):
+            val = row[ci] if ci < len(row) else ""
+            cell = ws.cell(start_row + ri, ci + 1, val if val else None)
+            cell.border = border
+            cell.alignment = align
+    return start_row + len(grid)
 
 
 def find_pdfs(input_path: str) -> List[str]:
     if os.path.isfile(input_path) and input_path.lower().endswith(".pdf"):
         return [input_path]
-    pdfs = sorted(glob.glob(os.path.join(input_path, "**", "*.pdf"), recursive=True))
-    return pdfs
+    out = []
+    for root, _, files in os.walk(input_path):
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                out.append(os.path.join(root, f))
+    return sorted(out)
 
 
-def convert(input_path: str, output_path: str, dpi: int = 300) -> None:
+def convert(input_path: str, output_path: str, dpi: int = 300):
     from openpyxl import Workbook
-    from openpyxl.utils import get_column_letter
-    from openpyxl.styles import Alignment, Font
+    from table_to_excel import write_table_to_sheet
 
     pdfs = find_pdfs(input_path)
     if not pdfs:
-        print(f"[!] 在 {input_path} 下没找到 PDF")
-        sys.exit(1)
+        print(f"没找到 PDF：{input_path}")
+        return
 
-    print(f"[i] 共 {len(pdfs)} 个 PDF，DPI={dpi}")
     wb = Workbook()
     wb.remove(wb.active)
-    used: set = set()
+    used_names = set()
 
-    for idx, pdf in enumerate(pdfs, 1):
-        name = os.path.splitext(os.path.basename(pdf))[0]
-        sheet = sanitize_sheet_name(name, used)
-        ws = wb.create_sheet(sheet)
-        print(f"  ({idx}/{len(pdfs)}) {os.path.basename(pdf)} -> 工作表「{sheet}」")
-        rowptr = 1
-        max_cols = 1
-        try:
-            for pno, total, img in render_pdf_pages(pdf, dpi):
-                ocr = ocr_image(img)
-                cells = boxes_to_cells(ocr)
-                grid = reconstruct_table(cells)
-                if total > 1:
-                    if pno > 1:
-                        rowptr += 1
-                    mark = ws.cell(rowptr, 1, f"—— 第{pno}/{total}页 ——")
-                    mark.font = Font(bold=True, color="888888")
-                    rowptr += 1
-                for line in grid:
-                    for ci, val in enumerate(line, 1):
-                        if val:
-                            cell = ws.cell(rowptr, ci, val)
-                            cell.alignment = Alignment(vertical="center", wrap_text=True)
-                    max_cols = max(max_cols, len(line))
-                    rowptr += 1
-        except Exception as exc:  # 单个 PDF 出错不影响整批
-            ws.cell(rowptr, 1, f"[转换失败] {type(exc).__name__}: {exc}")
-            print(f"      [!] 出错：{exc}")
-        # 简单设个列宽
-        for c in range(1, max_cols + 1):
-            ws.column_dimensions[get_column_letter(c)].width = 22
+    for pdf in pdfs:
+        base = os.path.splitext(os.path.basename(pdf))[0]
+        name = sanitize_sheet_name(base)
+        n = name
+        k = 1
+        while n in used_names:
+            k += 1
+            n = sanitize_sheet_name(f"{base}_{k}")
+        used_names.add(n)
+        ws = wb.create_sheet(n)
+        print(f"\n处理：{pdf} -> 工作表 [{n}]")
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        row_cursor = 1
+        for pno, total, img in render_pdf_pages(pdf, dpi=dpi):
+            print(f"  第 {pno + 1}/{total} 页 OCR...")
+            ocr_result = ocr_image(img)
+            if not ocr_result:
+                print("    （未识别到文字）")
+                continue
+
+            html = recognize_table_html(img, ocr_result, prefer="wired")
+            if html:
+                print("    ✓ 表格结构识别成功，还原合并单元格")
+                row_cursor = write_table_to_sheet(ws, html, start_row=row_cursor) + 1
+            else:
+                print("    · 未检测到表格，回退到坐标拼表")
+                grid = reconstruct_grid(ocr_result)
+                if grid:
+                    row_cursor = _write_grid_with_borders(ws, grid, start_row=row_cursor) + 1
+
+        # 列宽粗调
+        for col in ws.columns:
+            try:
+                letter = col[0].column_letter
+            except Exception:
+                continue
+            maxlen = 0
+            for c in col:
+                if c.value:
+                    maxlen = max(maxlen, len(str(c.value)))
+            ws.column_dimensions[letter].width = min(40, max(8, maxlen + 2))
+
     wb.save(output_path)
-    print(f"[✓] 完成：{output_path}")
+    print(f"\n完成：{output_path}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="批量把扫描件 PDF OCR 转 Excel（一 PDF 一工作表）")
-    ap.add_argument("-i", "--input", required=True, help="PDF 文件夹（或单个 PDF）")
-    ap.add_argument("-o", "--output", default="output.xlsx", help="输出 Excel 路径")
-    ap.add_argument("--dpi", type=int, default=300, help="渲染分辨率，越高越清但越慢（默认300）")
+    ap = argparse.ArgumentParser(description="PDF 批量转 Excel（还原表格格式）")
+    ap.add_argument("-i", "--input", required=True, help="PDF 文件或目录")
+    ap.add_argument("-o", "--output", default="out.xlsx", help="输出 xlsx")
+    ap.add_argument("--dpi", type=int, default=300, help="渲染 DPI（默认 300）")
     args = ap.parse_args()
-    convert(args.input, args.output, args.dpi)
+    convert(args.input, args.output, dpi=args.dpi)
 
 
 if __name__ == "__main__":
