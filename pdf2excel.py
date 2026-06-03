@@ -2,7 +2,9 @@
 """
 PDF 批量转 Excel（一个 PDF 一个工作表）。
 
-重点：尽量还原 PDF 里的表格显示格式（行列、合并单元格、边框）。
+重点：尽量还原 PDF 里的表格显示格式（行列、合并单元格、边框），
+同时保证不丢内容：即使表格模型在低质量扫描件上漏识了某些格，
+也会把未归入表格的 OCR 文字补在下面，供人工核对。
 
 识别思路：
 1. PyMuPDF 把每页渲染成图。
@@ -10,17 +12,19 @@ PDF 批量转 Excel（一个 PDF 一个工作表）。
 3. 表格结构识别（wired_table_rec / lineless_table_rec）把 OCR 结果
    组成带 rowspan/colspan 的 HTML 表格。
 4. table_to_excel 把 HTML 表格写成 Excel，还原合并单元格和边框。
-5. 若某页没检测到表格（比如快递面单、无线文本），回退到按坐标启发式拼表。
+5. 把表格没接住的 OCR 文字补在表下面（保证不丢）。
+6. 若某页根本没检测到表格（比如快递面单、无线文本），回退到按坐标启发式拼表。
 
 环境：Windows + VSCode，只能 pip 装包，首次联网下模型，之后可离线。
 """
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 
@@ -69,26 +73,66 @@ def ocr_image(img_bgr) -> list:
 
 # ----------------------------------------------------------------------------
 # 表格结构识别 → HTML
-# 优先用 wired_table_rec（有线表），其次 lineless_table_rec（无线表）。
-# 不同版本 API 不一样，这里做了兼容和异常保护。
+# 重要：WiredTableRecognition / LinelessTableRecognition 不是无参构造，
+# 需要传 WiredTableInput / LinelessTableInput（配置类常在 .main 里，不一定从包根导出）。
+# 这里按多种可能的 API 形状依次尝试，兼容不同版本。
 # ----------------------------------------------------------------------------
 _WIRED = None
 _LINELESS = None
 
 
+def _build_engine(kind: str):
+    """构造表格识别引擎，兼容：
+      - WiredTableRecognition(WiredTableInput())   # 新版，需配置对象
+      - WiredTableRecognition()                    # 旧版，无参
+    配置类优先从包根找，找不到再从 .main 找。
+    """
+    if kind == "wired":
+        pkg_name, rec_name, input_name = "wired_table_rec", "WiredTableRecognition", "WiredTableInput"
+    else:
+        pkg_name, rec_name, input_name = "lineless_table_rec", "LinelessTableRecognition", "LinelessTableInput"
+
+    pkg = importlib.import_module(pkg_name)
+    rec_cls = getattr(pkg, rec_name, None)
+    input_cls = getattr(pkg, input_name, None)
+
+    # 配置类 / 识别类 可能只在 .main 里
+    if rec_cls is None or input_cls is None:
+        try:
+            main_mod = importlib.import_module(pkg_name + ".main")
+            rec_cls = rec_cls or getattr(main_mod, rec_name, None)
+            input_cls = input_cls or getattr(main_mod, input_name, None)
+        except Exception:
+            pass
+
+    if rec_cls is None:
+        raise ImportError(f"找不到 {rec_name}，请确认已 pip install {pkg_name}")
+
+    last_err = None
+    # 优先用配置对象构造（新版），再回退到无参（旧版）
+    if input_cls is not None:
+        try:
+            return rec_cls(input_cls())
+        except Exception as e:
+            last_err = e
+    try:
+        return rec_cls()
+    except Exception as e:
+        last_err = e
+    raise last_err
+
+
 def _load_wired():
     global _WIRED
     if _WIRED is None:
-        from wired_table_rec import WiredTableRecognition
-        _WIRED = WiredTableRecognition()
+        _WIRED = _build_engine("wired")
     return _WIRED
 
 
 def _load_lineless():
     global _LINELESS
     if _LINELESS is None:
-        from lineless_table_rec import LinelessTableRecognition
-        _LINELESS = LinelessTableRecognition()
+        _LINELESS = _build_engine("lineless")
     return _LINELESS
 
 
@@ -96,7 +140,7 @@ def _extract_html(ret) -> Optional[str]:
     """从不同版本的返回值里拿出 HTML 字符串。"""
     if ret is None:
         return None
-    # 新版：对象带 .pred_html
+    # 新版：输出对象带 .pred_html
     html = getattr(ret, "pred_html", None)
     if html:
         return html
@@ -116,6 +160,10 @@ def recognize_table_html(img_bgr, ocr_result: list, prefer: str = "wired") -> Op
     for kind in order:
         try:
             engine = _load_wired() if kind == "wired" else _load_lineless()
+        except Exception as e:
+            print(f"    [表格识别-{kind}] 加载失败，跳过：{e}")
+            continue
+        try:
             try:
                 ret = engine(img_bgr, ocr_result=ocr_result)
             except TypeError:
@@ -124,8 +172,33 @@ def recognize_table_html(img_bgr, ocr_result: list, prefer: str = "wired") -> Op
             if html and "<td" in html.lower():
                 return html
         except Exception as e:
-            print(f"    [表格识别-{kind}] 跳过：{e}")
+            print(f"    [表格识别-{kind}] 运行出错，跳过：{e}")
     return None
+
+
+# ----------------------------------------------------------------------------
+# 不丢内容：找出表格没接住的 OCR 文字
+# ----------------------------------------------------------------------------
+def _norm(s) -> str:
+    return re.sub(r"\s+", "", str(s))
+
+
+def find_missing_texts(html: str, ocr_result: list) -> List[str]:
+    """返回 OCR 识别到、但没出现在表格 HTML 里的文字（去重后）。"""
+    from bs4 import BeautifulSoup
+    table_text = _norm(BeautifulSoup(html, "lxml").get_text())
+    missing, seen = [], set()
+    for item in ocr_result:
+        if len(item) < 2:
+            continue
+        raw = str(item[1]).strip()
+        key = _norm(raw)
+        if not key or key in seen:
+            continue
+        if key not in table_text:
+            missing.append(raw)
+            seen.add(key)
+    return missing
 
 
 # ----------------------------------------------------------------------------
@@ -138,10 +211,6 @@ class Box:
     y0: float
     x1: float
     y1: float
-
-    @property
-    def cx(self):
-        return (self.x0 + self.x1) / 2
 
     @property
     def cy(self):
@@ -166,14 +235,13 @@ def _to_boxes(ocr_result: list) -> List[Box]:
 
 
 def reconstruct_grid(ocr_result: list) -> List[List[str]]:
-    """按行聚类 + 列聚类的启发式表格。"""
+    """按行聚类 + 列聚类的启发式表格（不丢文字）。"""
     boxes = _to_boxes(ocr_result)
     if not boxes:
         return []
     boxes.sort(key=lambda b: b.cy)
     med_h = float(np.median([b.h for b in boxes if b.h > 0]) or 12)
 
-    # 分行
     rows: List[List[Box]] = []
     cur: List[Box] = [boxes[0]]
     for b in boxes[1:]:
@@ -183,7 +251,6 @@ def reconstruct_grid(ocr_result: list) -> List[List[str]]:
             rows.append(cur); cur = [b]
     rows.append(cur)
 
-    # 由所有 box 的左边界聚类出列
     lefts = sorted(b.x0 for b in boxes)
     cols: List[float] = [lefts[0]]
     for x in lefts[1:]:
@@ -213,10 +280,15 @@ def sanitize_sheet_name(name: str) -> str:
     return name[:31]
 
 
-def _write_grid_with_borders(ws, grid: List[List[str]], start_row: int = 1) -> int:
-    from openpyxl.styles import Border, Side, Alignment
+def _thin_border():
+    from openpyxl.styles import Border, Side
     thin = Side(style="thin", color="000000")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    return Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def _write_grid_with_borders(ws, grid: List[List[str]], start_row: int = 1) -> int:
+    from openpyxl.styles import Alignment
+    border = _thin_border()
     align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ncols = max((len(r) for r in grid), default=0)
     for ri, row in enumerate(grid):
@@ -226,6 +298,21 @@ def _write_grid_with_borders(ws, grid: List[List[str]], start_row: int = 1) -> i
             cell.border = border
             cell.alignment = align
     return start_row + len(grid)
+
+
+def _write_missing_block(ws, missing: List[str], start_row: int) -> int:
+    """把未归入表格的文字补在下面，加一个提示抬头。"""
+    if not missing:
+        return start_row
+    from openpyxl.styles import Font
+    r = start_row + 1  # 空一行
+    c = ws.cell(r, 1, "↓ 以下为未归入表格的识别文字（请人工核对）")
+    c.font = Font(bold=True, color="C00000")
+    r += 1
+    for t in missing:
+        ws.cell(r, 1, t)
+        r += 1
+    return r
 
 
 def find_pdfs(input_path: str) -> List[str]:
@@ -255,8 +342,7 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
     for pdf in pdfs:
         base = os.path.splitext(os.path.basename(pdf))[0]
         name = sanitize_sheet_name(base)
-        n = name
-        k = 1
+        n, k = name, 1
         while n in used_names:
             k += 1
             n = sanitize_sheet_name(f"{base}_{k}")
@@ -274,8 +360,11 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
 
             html = recognize_table_html(img, ocr_result, prefer="wired")
             if html:
-                print("    ✓ 表格结构识别成功，还原合并单元格")
-                row_cursor = write_table_to_sheet(ws, html, start_row=row_cursor) + 1
+                missing = find_missing_texts(html, ocr_result)
+                print(f"    ✓ 表格结构识别成功；未归入文字 {len(missing)} 条")
+                row_cursor = write_table_to_sheet(ws, html, start_row=row_cursor)
+                row_cursor = _write_missing_block(ws, missing, row_cursor)
+                row_cursor += 1
             else:
                 print("    · 未检测到表格，回退到坐标拼表")
                 grid = reconstruct_grid(ocr_result)
@@ -288,10 +377,7 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
                 letter = col[0].column_letter
             except Exception:
                 continue
-            maxlen = 0
-            for c in col:
-                if c.value:
-                    maxlen = max(maxlen, len(str(c.value)))
+            maxlen = max((len(str(c.value)) for c in col if c.value), default=0)
             ws.column_dimensions[letter].width = min(40, max(8, maxlen + 2))
 
     wb.save(output_path)
@@ -299,10 +385,10 @@ def convert(input_path: str, output_path: str, dpi: int = 300):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="PDF 批量转 Excel（还原表格格式）")
+    ap = argparse.ArgumentParser(description="PDF 批量转 Excel（还原表格格式，不丢内容）")
     ap.add_argument("-i", "--input", required=True, help="PDF 文件或目录")
     ap.add_argument("-o", "--output", default="out.xlsx", help="输出 xlsx")
-    ap.add_argument("--dpi", type=int, default=300, help="渲染 DPI（默认 300）")
+    ap.add_argument("--dpi", type=int, default=300, help="渲染 DPI（默认 300，扫描件不清晰可调 400）")
     args = ap.parse_args()
     convert(args.input, args.output, dpi=args.dpi)
 
