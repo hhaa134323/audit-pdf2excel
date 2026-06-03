@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.vscode/
+# 不提交数据 / 输出
+pdfs/
+*.xlsx
+*.pdf
