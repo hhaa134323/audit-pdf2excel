@@ -50,6 +50,12 @@ def _norm(s) -> str:
     return re.sub(r"\s+", "", str(s))
 
 
+def _looks_like_serial(text) -> bool:
+    """序号列的值：1~3 位纯数字（1、2、3…）。
+    用来过滤掉银行名称等宽文本左缘被误判进序号列的碎块。"""
+    return bool(re.fullmatch(r"\d{1,3}", _norm(text)))
+
+
 def to_boxes(ocr_result: list, min_score: float = 0.0) -> List[Box]:
     """RapidOCR 格式 [[quad, text, score], ...] -> List[Box]，低于 min_score 的丢弃。"""
     boxes = []
@@ -260,6 +266,46 @@ def _group_lines(items: List[Box]) -> str:
     return "".join(parts)
 
 
+def _data_row_seps(data_boxes: List[Box], anchors: List[Box], header_bottom: float) -> List[float]:
+    """确定每个逻辑行的 y 边界（rsep）。
+
+    早期做法是“相邻序号中心的中点”。但序号在它那行里是竖直居中的，而各行
+    高度往往不一致（银行名称折行行数不同）。两行高度一不齐，中点就不等于真
+    实行界，会把高行底部的文字（如“广州科学城支行”）切到下一行——行数越多
+    越容易踩。这里改成：在两个序号之间，把边界放到“相邻物理行之间最大的那段
+    空白”上，贴着真实行间留白来切，对不等行高更稳。
+    """
+    if not anchors:
+        return [header_bottom, 1e9]
+    lines = _cluster_rows(data_boxes)
+    spans = []  # (物理行中心 cy, 顶 y0, 底 y1)
+    for ln in lines:
+        spans.append((
+            float(np.mean([b.cy for b in ln])),
+            min(b.y0 for b in ln),
+            max(b.y1 for b in ln),
+        ))
+    spans.sort(key=lambda t: t[0])
+    # 相邻物理行之间的空白：(中点 y, 空白大小)
+    gaps = []
+    for k in range(len(spans) - 1):
+        mid = (spans[k][0] + spans[k + 1][0]) / 2
+        gap = spans[k + 1][1] - spans[k][2]
+        gaps.append((mid, gap))
+
+    rsep = [header_bottom]
+    for i in range(len(anchors) - 1):
+        lo, hi = anchors[i].cy, anchors[i + 1].cy
+        between = [(gap, mid) for (mid, gap) in gaps if lo < mid < hi]
+        if between:
+            between.sort(reverse=True)  # 最大空白优先
+            rsep.append(between[0][1])
+        else:
+            rsep.append((lo + hi) / 2)  # 两序号间没有可分的物理行，退回中点
+    rsep.append(1e9)
+    return rsep
+
+
 def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Optional[dict] = None):
     """返回 (cells, n_rows, n_cols, covered_keys) 或 None。
     cells: [{r0,r1,c0,c1,text}]。0-based 闭区间。
@@ -284,15 +330,13 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Option
     pre_rows = rows[:hi]
     data_boxes = [b for b in boxes if b.cy > header_bottom + 1]
 
-    # 行区：用最左列（第 0 列）的框做锚点
-    anchors = sorted([b for b in data_boxes if _col_of(b.cx, seps) == 0], key=lambda b: b.cy)
-    if anchors:
-        rsep = [header_bottom]
-        for i in range(len(anchors) - 1):
-            rsep.append((anchors[i].cy + anchors[i + 1].cy) / 2)
-        rsep.append(1e9)
-    else:
-        rsep = [header_bottom, 1e9]
+    # 行区锚点：最左列（序号列）里“看起来像序号的纯数字框”。
+    # 只认纯数字能避免银行名称等宽文本的左缘碎块被误当成行锚点——
+    # 行越多，这种碎块越多，过去会凭空多切出错位的行。
+    col0 = [b for b in data_boxes if _col_of(b.cx, seps) == 0]
+    serial = [b for b in col0 if _looks_like_serial(b.text)]
+    anchors = sorted(serial or col0, key=lambda b: b.cy)
+    rsep = _data_row_seps(data_boxes, anchors, header_bottom)
     nbands = len(rsep) - 1
 
     def band_of(y):
@@ -347,6 +391,8 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Option
     if debug is not None:
         debug["header"] = [b.text for b in header]
         debug["col_seps"] = seps
+        debug["row_seps"] = rsep
+        debug["anchors"] = [b.text for b in anchors]
         debug["n_rows"] = n_rows
         debug["n_cols"] = ncols
         debug["cells"] = cells
