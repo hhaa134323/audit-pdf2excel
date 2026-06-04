@@ -6,15 +6,15 @@
 2. 取“框最多”的那一行作为表头；表头如果自己换行成多行（同一列上下两个框），
    先按 x 重叠把它们并回同一列，避免多出一个空列。
 3. 用表头每个框的 x 位置定列边界。
-4. 表头下面的数据区：用最左列（序号）的框定“逻辑行”边界（一行可能占好几行文字）。
+4. 表头下面的数据区：用“图像横线 + 文字竖直投影留白 + 表底截断”三路合并定“逻辑行”边界
+   （一行可能占好几行文字）。不再依赖序号列做锡点——OCR 经常漏识“1、3”这种孤立数字。
 5. 每个文本框按中心点落在哪列 + 哪行区，就归到那个单元格；同一格多行从上到下拼接。
 6. 关键：OCR 经常把同一横排、跨好几列的文字识别成一个超宽的框
    （例如“账号+账户名称+账户性质”连在一起）。对这种跨多列的框，按
-   “数字串 / 中文串”切成片段，每段按自己的中心 x 归到对应列——这样账号
-   这种连续数字串会被整段保留、不会被拆断或塞错列。
+   “数字串 / 中文串”切成片段，每段按自己的中心 x 归到对应列。
 7. 表头上面的行（存款人名称/核准号这类 label-value）单独处理。
 
-这个模块不依赖 OCR / 模型，可单独单测。
+这个模块不依赖 OCR / 模型，可单独单测（row_lines 为空时仅用投影与截断）。
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -50,12 +50,6 @@ def _norm(s) -> str:
     return re.sub(r"\s+", "", str(s))
 
 
-def _looks_like_serial(text) -> bool:
-    """序号列的值：1~3 位纯数字（1、2、3…）。
-    用来过滤掉银行名称等宽文本左缘被误判进序号列的碎块。"""
-    return bool(re.fullmatch(r"\d{1,3}", _norm(text)))
-
-
 def to_boxes(ocr_result: list, min_score: float = 0.0) -> List[Box]:
     """RapidOCR 格式 [[quad, text, score], ...] -> List[Box]，低于 min_score 的丢弃。"""
     boxes = []
@@ -89,9 +83,6 @@ def _cluster_rows(boxes: List[Box]) -> List[List[Box]]:
 
 
 def _merge_header_columns(header: List[Box]) -> List[Box]:
-    """合并同一列因换行被拆成上下两个框的表头（x 区间高度重叠的相邻框）。
-    例如“开户银”/“行名称”应并成一个表头列“开户银行名称”，否则会多出一空列。
-    """
     if not header:
         return header
     hs = sorted(header, key=lambda b: b.cx)
@@ -133,10 +124,6 @@ def _is_digitish(ch: str) -> bool:
 
 
 def _split_text_runs(text: str) -> List[Tuple[str, int, int]]:
-    """把字符串切成“数字串 / 文字串”交替的片段。
-    返回 [(子串, 起始字符下标, 结束字符下标含), ...]。
-    去掉两端空白后再判定类别，保证“账号”这种连续数字整段不被拆开。
-    """
     runs: List[Tuple[str, int, int]] = []
     i, n = 0, len(text)
     while i < n:
@@ -152,7 +139,6 @@ def _split_text_runs(text: str) -> List[Tuple[str, int, int]]:
 
 
 def _spanned_cols(b: Box, seps: List[float]) -> List[int]:
-    """这个框的 x 区间实际压住了哪几列（重叠量足够才算）。"""
     w = max(1.0, b.x1 - b.x0)
     cols = []
     for i in range(len(seps) - 1):
@@ -165,13 +151,6 @@ def _spanned_cols(b: Box, seps: List[float]) -> List[int]:
 
 
 def _split_if_multicol(b: Box, seps: List[float]) -> List[Box]:
-    """若一个数据框横跨多列（OCR 把多列文字连成一个框），按字符拆开归列。
-
-    要点：
-    - 汉字比数字宽，用加权字宽（数字 0.6 / 其他 1.0）估算每个字的 x，比均匀划分准。
-    - 保护连续数字串（如账号）：整段归到多数字符所在列，绝不拆断。
-    - 连续同列的字符合成一个子框。
-    单列框原样返回。"""
     if len(_spanned_cols(b, seps)) < 2:
         return [b]
     text = b.text
@@ -181,28 +160,21 @@ def _split_if_multicol(b: Box, seps: List[float]) -> List[Box]:
     width = b.x1 - b.x0
     weights = [0.6 if _is_digitish(c) else 1.0 for c in text]
     total = sum(weights) or 1.0
-
-    # 每个字符的加权中心 x 与所属列
     cum = 0.0
     centers = []
     for w in weights:
         centers.append(b.x0 + (cum + w / 2) / total * width)
         cum += w
     cols = [_col_of(cx, seps) for cx in centers]
-
-    # 保护连续数字串：整段统一到多数列
     for sub, i0, i1 in _split_text_runs(text):
         if sub and all(_is_digitish(ch) for ch in sub):
             seg = cols[i0:i1 + 1]
             mc = max(set(seg), key=seg.count)
             for k in range(i0, i1 + 1):
                 cols[k] = mc
-
-    # 边界上的累计宽度（用于子框 x0/x1）
     cumw = [0.0]
     for w in weights:
         cumw.append(cumw[-1] + w)
-
     out: List[Box] = []
     k = 0
     while k < n:
@@ -219,12 +191,6 @@ def _split_if_multicol(b: Box, seps: List[float]) -> List[Box]:
 
 
 def _refine_seps(seps: List[float], data_boxes: List[Box]) -> List[float]:
-    """用数据区里“只占一列”的框修正列边界。
-
-    表头文字常比数据窄，靠表头算的边界会把“名称”这种宽列的末尾几个字
-    划到右边列。这里以“右边列内容的最左 x”作为两列间的边界，把边界之左
-    都归给左列，避免误切。只在不与左列已知内容冲突时才采用。
-    """
     cols_boxes = {}
     for b in data_boxes:
         sc = _spanned_cols(b, seps)
@@ -232,7 +198,7 @@ def _refine_seps(seps: List[float], data_boxes: List[Box]) -> List[float]:
             cols_boxes.setdefault(sc[0], []).append(b)
     new = list(seps)
     margin = 3.0
-    for i in range(1, len(seps) - 1):  # 第 i-1 列与第 i 列之间的边界
+    for i in range(1, len(seps) - 1):
         right = cols_boxes.get(i)
         if not right:
             continue
@@ -240,7 +206,6 @@ def _refine_seps(seps: List[float], data_boxes: List[Box]) -> List[float]:
         left = cols_boxes.get(i - 1)
         left_right = max(b.x1 for b in left) + margin if left else None
         if left_right is not None and right_left <= left_right:
-            # 左右内容重叠，退回取中点
             new[i] = (left_right + right_left) / 2
         else:
             new[i] = right_left
@@ -248,7 +213,6 @@ def _refine_seps(seps: List[float], data_boxes: List[Box]) -> List[float]:
 
 
 def _group_lines(items: List[Box]) -> str:
-    """单元格内多框按从上到下、从左到右拼接（中文/数字不加空格）。"""
     if not items:
         return ""
     med_h = float(np.median([b.h for b in items if b.h > 0]) or 12)
@@ -266,50 +230,59 @@ def _group_lines(items: List[Box]) -> str:
     return "".join(parts)
 
 
-def _data_row_seps(data_boxes: List[Box], anchors: List[Box], header_bottom: float) -> List[float]:
-    """确定每个逻辑行的 y 边界（rsep）。
+def _row_bands(data_boxes: List[Box], seps: List[float], header_bottom: float,
+               med_h: float, row_lines: Optional[List[float]] = None
+               ) -> Tuple[List[float], float]:
+    """确定数据区每个逻辑行的 y 边界，返回 (rsep, table_bottom)。
 
-    早期做法是“相邻序号中心的中点”。但序号在它那行里是竖直居中的，而各行
-    高度往往不一致（银行名称折行行数不同）。两行高度一不齐，中点就不等于真
-    实行界，会把高行底部的文字（如“广州科学城支行”）切到下一行——行数越多
-    越容易踩。这里改成：在两个序号之间，把边界放到“相邻物理行之间最大的那段
-    空白”上，贴着真实行间留白来切，对不等行高更稳。
+    扫描件三类麻烦：行高不等、横线被印章/水印冲淡、表下方还有印章落款。
+    单靠序号列做锡点不稳（OCR 经常漏掉“1、3”这种孤立数字）。这里三路合并：
+      1. 图像横线 row_lines：能切“被内容填满、几乎不留白”的相邻行；
+      2. 文字竖直投影的成片大留白：补横线缺失处；
+      3. 表底截断：遇到超大留白就认为下面是印章/落款，整体截断。
     """
-    if not anchors:
-        return [header_bottom, 1e9]
-    lines = _cluster_rows(data_boxes)
-    spans = []  # (物理行中心 cy, 顶 y0, 底 y1)
-    for ln in lines:
-        spans.append((
-            float(np.mean([b.cy for b in ln])),
-            min(b.y0 for b in ln),
-            max(b.y1 for b in ln),
-        ))
-    spans.sort(key=lambda t: t[0])
-    # 相邻物理行之间的空白：(中点 y, 空白大小)
-    gaps = []
-    for k in range(len(spans) - 1):
-        mid = (spans[k][0] + spans[k + 1][0]) / 2
-        gap = spans[k + 1][1] - spans[k][2]
-        gaps.append((mid, gap))
-
-    rsep = [header_bottom]
-    for i in range(len(anchors) - 1):
-        lo, hi = anchors[i].cy, anchors[i + 1].cy
-        between = [(gap, mid) for (mid, gap) in gaps if lo < mid < hi]
-        if between:
-            between.sort(reverse=True)  # 最大空白优先
-            rsep.append(between[0][1])
+    in_table = [b for b in data_boxes if seps[1] - 1 <= b.cx <= seps[-2] + 1]
+    if not in_table:
+        in_table = list(data_boxes)
+    if not in_table:
+        return [header_bottom, 1e9], 1e9
+    ivs = sorted([(b.y0, b.y1) for b in in_table])
+    bands = [list(ivs[0])]
+    for a, c in ivs[1:]:
+        if a <= bands[-1][1] + 2:
+            bands[-1][1] = max(bands[-1][1], c)
         else:
-            rsep.append((lo + hi) / 2)  # 两序号间没有可分的物理行，退回中点
-    rsep.append(1e9)
-    return rsep
+            bands.append([a, c])
+    GAP_ROW = 0.45 * med_h     # 成片留白 > 此值才算换逻辑行
+    GAP_STAMP = 1.8 * med_h    # 超大留白：下面多半是印章/落款，截断
+    kept = [bands[0]]
+    for b in bands[1:]:
+        if b[0] - kept[-1][1] > GAP_STAMP:
+            break
+        kept.append(b)
+    table_bottom = kept[-1][1]
+    pgaps = [(kept[i - 1][1] + kept[i][0]) / 2
+             for i in range(1, len(kept))
+             if kept[i][0] - kept[i - 1][1] > GAP_ROW]
+    hlines = [y for y in (row_lines or [])
+              if header_bottom + 8 < y < table_bottom - 5]
+    cand = sorted(pgaps + hlines)
+    merged: List[float] = []
+    for y in cand:
+        if merged and abs(y - merged[-1]) < med_h * 0.8:
+            merged[-1] = (merged[-1] + y) / 2   # 横线与留白指向同一处，合一
+        else:
+            merged.append(y)
+    return [header_bottom] + merged + [table_bottom], table_bottom
 
 
-def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Optional[dict] = None):
+def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5,
+                         debug: Optional[dict] = None,
+                         row_lines: Optional[List[float]] = None):
     """返回 (cells, n_rows, n_cols, covered_keys) 或 None。
     cells: [{r0,r1,c0,c1,text}]。0-based 闭区间。
     找不到明确表头（>=3 列）返回 None。
+    row_lines: 图像检测到的水平表格线 y 坐标（与 OCR 同坐标系），可为空。
     """
     boxes = to_boxes(ocr_result, min_score=min_score)
     if len(boxes) < 4:
@@ -330,14 +303,12 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Option
     pre_rows = rows[:hi]
     data_boxes = [b for b in boxes if b.cy > header_bottom + 1]
 
-    # 行区锚点：最左列（序号列）里“看起来像序号的纯数字框”。
-    # 只认纯数字能避免银行名称等宽文本的左缘碎块被误当成行锚点——
-    # 行越多，这种碎块越多，过去会凭空多切出错位的行。
-    col0 = [b for b in data_boxes if _col_of(b.cx, seps) == 0]
-    serial = [b for b in col0 if _looks_like_serial(b.text)]
-    anchors = sorted(serial or col0, key=lambda b: b.cy)
-    rsep = _data_row_seps(data_boxes, anchors, header_bottom)
+    # 逻辑行边界：横线 + 投影留白 + 表底截断（不再依赖序号列锡点）
+    med_h = float(np.median([b.h for b in data_boxes if b.h > 0]) or 12)
+    rsep, table_bottom = _row_bands(data_boxes, seps, header_bottom, med_h, row_lines)
     nbands = len(rsep) - 1
+    # 表底以下（印章/落款）不进表格，留给“未归入文字”兑底区
+    data_boxes = [b for b in data_boxes if b.cy < table_bottom + med_h * 0.5]
 
     def band_of(y):
         for i in range(nbands):
@@ -349,7 +320,6 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Option
     covered = set()
     r = 0
 
-    # 表头上面的 label-value 行
     for pr in pre_rows:
         sb = sorted(pr, key=lambda b: b.cx)
         for b in sb:
@@ -365,13 +335,11 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Option
                           "text": _group_lines(valboxes)})
         r += 1
 
-    # 表头
     for ci, b in enumerate(header):
         covered.add(_norm(b.text))
         cells.append({"r0": r, "r1": r, "c0": ci, "c1": ci, "text": b.text})
     r += 1
 
-    # 数据区：先用数据本身修正列边界，再把跨多列的超宽框按片段拆开，各自归列
     dseps = _refine_seps(seps, data_boxes)
     grid = {}
     for b in data_boxes:
@@ -392,7 +360,8 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5, debug: Option
         debug["header"] = [b.text for b in header]
         debug["col_seps"] = seps
         debug["row_seps"] = rsep
-        debug["anchors"] = [b.text for b in anchors]
+        debug["row_lines_detected"] = list(row_lines or [])
+        debug["table_bottom"] = table_bottom
         debug["n_rows"] = n_rows
         debug["n_cols"] = ncols
         debug["cells"] = cells

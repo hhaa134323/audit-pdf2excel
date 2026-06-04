@@ -9,7 +9,8 @@ PDF 批量转 Excel（一个 PDF 一个工作表）。
 1. PyMuPDF 把每页渲染成图。
 2. RapidOCR 识别文字（得到带坐标的文本框）。
 3. 【主路】reconstruct_from_ocr：直接用 OCR 文本框坐标重建表格——
-   用“框最多”的一行定表头与列边界，用最左列（序号）定逻辑行边界，
+   用“框最多”的一行定表头与列边界；表头下面的数据区用“图像横线 +
+   文字竖直投影留白 + 表底截断”三路合并定逻辑行边界（一行可能折好几行文字），
    每个文本框按中心点归到对应单元格。多行折行的账号/名称不会错位，
    且不依赖表格模型那套不稳定的内部文本归位。
 4. 回退：表格结构模型（wired/lineless）→ 坐标启发式拼表。
@@ -71,6 +72,53 @@ def ocr_image(img_bgr) -> list:
     engine = get_ocr_engine()
     result, _ = engine(img_bgr)
     return result or []
+
+
+# ----------------------------------------------------------------------------
+# 水平表格线检测（给行切分用）
+# ----------------------------------------------------------------------------
+def detect_row_lines(img_bgr) -> List[float]:
+    """检测图像里的水平表格线，返回 y 坐标列表（与 OCR 同坐标系）。
+
+    扫描件横线常被印章/水印冲淡，这里只作为行切分的“主依据之一”：
+    检测得到的线交给 reconstruct 与“文字投影留白 + 表底截断”一起判断，
+    缺失的线由投影留白补齐。cv2 不可用或出错时返回空列表，完全不影响主流程。
+    """
+    try:
+        import cv2
+    except Exception:
+        return []
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        bw = cv2.adaptiveThreshold(~gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, 15, -2)
+        H, W = bw.shape
+        # 先用竖线估表格 x 跨度，避免页边噪声拉低横线占比
+        vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(10, H // 30)))
+        ver = cv2.dilate(cv2.erode(bw, vk), vk)
+        colsum = ver.sum(axis=0) / 255.0
+        xc = [x for x in range(W) if colsum[x] > H * 0.12]
+        x0, x1 = (min(xc), max(xc)) if xc else (0, W)
+        span = max(1, x1 - x0)
+        # 提取水平线并桥接断口
+        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, W // 40), 1))
+        hor = cv2.dilate(cv2.erode(bw, hk), hk)
+        br = cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, W // 15), 1))
+        hor = cv2.erode(cv2.dilate(hor, br), br)
+        rowsum = hor[:, x0:x1].sum(axis=1) / 255.0
+        ys = [y for y in range(H) if rowsum[y] > span * 0.35]
+        lines: List[float] = []
+        group: List[int] = []
+        for y in sorted(ys):
+            if group and y - group[-1] > 12:
+                lines.append(sum(group) / len(group))
+                group = []
+            group.append(y)
+        if group:
+            lines.append(sum(group) / len(group))
+        return lines
+    except Exception:
+        return []
 
 
 # ----------------------------------------------------------------------------
@@ -484,8 +532,12 @@ def convert(input_path: str, output_path: str, dpi: int = 300,
                 print("    （未识别到文字）")
                 continue
 
+            # 检测水平表格线，交给重建做行切分（检测不到也不影响）
+            row_lines = detect_row_lines(img)
+
             dbg = {} if debug else None
-            recon = reconstruct_from_ocr(ocr_result, min_score=min_score, debug=dbg)
+            recon = reconstruct_from_ocr(ocr_result, min_score=min_score, debug=dbg,
+                                         row_lines=row_lines)
             if debug:
                 debug_pages.append({
                     "pdf": os.path.basename(pdf), "page": pno + 1,
