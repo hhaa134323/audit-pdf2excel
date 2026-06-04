@@ -104,6 +104,40 @@ def _merge_header_columns(header: List[Box]) -> List[Box]:
     return merged
 
 
+def _recover_columns(header: List[Box], data_boxes: List[Box], med_h: float) -> List[Box]:
+    """OCR 有时整列表头都没认出来（比如“账号”），导致该列数据挤进相邻列。
+    若相邻表头之间出现异常大的空档，且空档中部稳定地落着跨多行的数据框，
+    就认定这是一列被漏识表头的隐藏列，补一个空表头占位，让数据各归各列。
+    仅在空档明显过宽 + 中部有≥2个、且跨多行的数据框时才触发，
+    表头识别完整的表不会受影响。
+    """
+    if len(header) < 2 or not data_boxes:
+        return header
+    hs = sorted(header, key=lambda b: b.cx)
+    widths = [b.x1 - b.x0 for b in hs if b.x1 > b.x0]
+    med_w = float(np.median(widths)) if widths else 200.0
+    hy0 = min(b.y0 for b in hs)
+    hy1 = max(b.y1 for b in hs)
+    extra: List[Box] = []
+    for i in range(len(hs) - 1):
+        L, R = hs[i].x1, hs[i + 1].x0
+        gap = R - L
+        if gap <= med_w * 1.5:
+            continue
+        lo, hi = L + gap * 0.15, R - gap * 0.15  # 只看空档中部，避免接近邻列的碎片
+        gb = [b for b in data_boxes if lo < b.cx < hi]
+        if len(gb) < 2:
+            continue
+        if max(b.cy for b in gb) - min(b.cy for b in gb) < med_h * 1.5:
+            continue  # 需跨多行，排除单个零散框误触发
+        x0 = min(b.x0 for b in gb)
+        x1 = max(b.x1 for b in gb)
+        extra.append(Box("", x0, hy0, x1, hy1, 1.0))
+    if not extra:
+        return header
+    return sorted(hs + extra, key=lambda b: b.cx)
+
+
 def _col_seps(header: List[Box]) -> List[float]:
     seps = [-1e9]
     for i in range(len(header) - 1):
@@ -297,14 +331,17 @@ def reconstruct_from_ocr(ocr_result: list, min_score: float = 0.5,
     if len(header) < 3:
         return None
 
-    seps = _col_seps(header)
-    ncols = len(header)
     header_bottom = max(b.y1 for b in header)
     pre_rows = rows[:hi]
     data_boxes = [b for b in boxes if b.cy > header_bottom + 1]
 
     # 逻辑行边界：横线 + 投影留白 + 表底截断（不再依赖序号列锡点）
     med_h = float(np.median([b.h for b in data_boxes if b.h > 0]) or 12)
+
+    # 补回被漏识表头的隐藏列（如“账号”），避免数据挤进相邻列
+    header = _recover_columns(header, data_boxes, med_h)
+    seps = _col_seps(header)
+    ncols = len(header)
     rsep, table_bottom = _row_bands(data_boxes, seps, header_bottom, med_h, row_lines)
     nbands = len(rsep) - 1
     # 表底以下（印章/落款）不进表格，留给“未归入文字”兑底区
